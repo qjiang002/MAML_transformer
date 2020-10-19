@@ -13,28 +13,24 @@ from bert import modeling as bert_modeling
 FLAGS = flags.FLAGS
 
 ## Dataset/method options
-#flags.DEFINE_string('datasource', 'sinusoid', 'sinusoid or omniglot or miniimagenet')
 flags.DEFINE_integer('num_classes', 2, 'number of classes used in classification (e.g. 2-way classification).')
-# oracle means task id is input (only suitable for sinusoid)
-#flags.DEFINE_string('baseline', None, 'oracle, or None')
-
+flags.DEFINE_integer('max_seq_len', 50, 'max sentence length')
 ## Training options
 flags.DEFINE_integer('pretrain_iterations', 0, 'number of pre-training iterations.')
-flags.DEFINE_integer('metatrain_iterations', 20, 'number of metatraining iterations.') # 15k for omniglot, 50k for sinusoid
+flags.DEFINE_integer('metatrain_iterations', 6000, 'number of metatraining iterations.') # 15k for omniglot, 50k for sinusoid
 flags.DEFINE_integer('meta_batch_size', 4, 'number of tasks sampled per meta-update')
-flags.DEFINE_float('meta_lr', 0.001, 'the base learning rate of the generator')
-flags.DEFINE_integer('update_batch_size', 10, 'number of examples used for inner gradient update (K for K-shot learning).')
-flags.DEFINE_float('update_lr', 1e-3, 'step size alpha for inner gradient update.') # 0.1 for omniglot
-flags.DEFINE_integer('num_updates', 4, 'number of inner gradient updates during training.')
+flags.DEFINE_float('meta_lr', 1e-5, 'the base learning rate of the generator')
+flags.DEFINE_integer('update_batch_size', 5, 'number of examples used for inner gradient update (K for K-shot learning).')
+flags.DEFINE_float('update_lr', 2e-6, 'step size alpha for inner gradient update.') # 0.1 for omniglot
+flags.DEFINE_integer('num_updates', 5, 'number of inner gradient updates during training.')
 flags.DEFINE_bool('use_transformer', True, 'whether to use transformers to replace forward neural network')
 flags.DEFINE_integer('num_transformer', 4, 'number of transformers')
-
 ## Model options
 #flags.DEFINE_string('norm', 'batch_norm', 'batch_norm, layer_norm, or None')
 #flags.DEFINE_integer('num_filters', 64, 'number of filters for conv nets -- 32 for miniimagenet, 64 for omiglot.')
 #flags.DEFINE_bool('conv', True, 'whether or not to use a convolutional network, only applicable in some cases')
 #flags.DEFINE_bool('max_pool', False, 'Whether or not to use max pooling rather than strided convolutions')
-#flags.DEFINE_bool('stop_grad', False, 'if True, do not use second derivatives in meta-optimization (for speed)')
+flags.DEFINE_bool('stop_grad', False, 'if True, do not use second derivatives in meta-optimization (for speed)')
 
 ## Logging, saving, and testing options
 flags.DEFINE_string("bert_config_file", './checkpoint/uncased_L-12_H-768_A-12/bert_config.json', "The config json file corresponding to the pre-trained BERT model.")
@@ -42,19 +38,19 @@ flags.DEFINE_string('meta_train_tasks','./data/meta_train_tasks.list','list of t
 flags.DEFINE_string('meta_test_tasks','./data/meta_test_tasks.list','list of tasks in meta_testing')
 flags.DEFINE_bool('log', True, 'if false, do not log summaries, for debugging code.')
 flags.DEFINE_string('logdir', './output', 'directory for summaries and checkpoints.')
-flags.DEFINE_bool('resume', True, 'resume training if there is a model available')
+flags.DEFINE_bool('resume', False, 'resume training if there is a model available')
 flags.DEFINE_bool('train', True, 'True to train, False to test.')
 flags.DEFINE_integer('test_iter', -1, 'iteration to load model (-1 for latest model)')
-flags.DEFINE_bool('test_set', False, 'Set to true to test on the the test set, False for the validation set.')
+flags.DEFINE_bool('test', False, 'Set to true to test on the the test set, False for the validation set.')
 flags.DEFINE_integer('train_update_batch_size', -1, 'number of examples used for gradient update during training (use if you want to test with a different number).')
 flags.DEFINE_float('train_update_lr', -1, 'value of inner gradient step step during training. (use if you want to test with a different value)') # 0.1 for omniglot
 
 def train(model, saver, sess, exp_string, data_generator, resume_itr=0):
-    SUMMARY_INTERVAL = 10
+    SUMMARY_INTERVAL = 2
     SAVE_INTERVAL = 1000
     
-    PRINT_INTERVAL = 10
-    TEST_PRINT_INTERVAL = PRINT_INTERVAL*5
+    PRINT_INTERVAL = 2
+    TEST_PRINT_INTERVAL = PRINT_INTERVAL
 
     if FLAGS.log:
         train_writer = tf.summary.FileWriter(FLAGS.logdir + '/' + exp_string, sess.graph)
@@ -66,11 +62,10 @@ def train(model, saver, sess, exp_string, data_generator, resume_itr=0):
 
     for itr in range(resume_itr, FLAGS.pretrain_iterations + FLAGS.metatrain_iterations):
         feed_dict = {}
-        
         if itr < FLAGS.pretrain_iterations:
             input_tensors = [model.pretrain_op]
         else:
-            input_tensors = [model.metatrain_op]
+            input_tensors = [model.metatrain_op] 
 
         if (itr % SUMMARY_INTERVAL == 0 or itr % PRINT_INTERVAL == 0):
             input_tensors.extend([model.summ_op, model.total_loss1, model.total_losses2[FLAGS.num_updates-1]])
@@ -81,19 +76,19 @@ def train(model, saver, sess, exp_string, data_generator, resume_itr=0):
 
 
         if itr % SUMMARY_INTERVAL == 0:
-            #print("train/result: ", result)
-            prelosses.append(result[-2])
+            
+            prelosses.append(result[-4])
             if FLAGS.log:
                 train_writer.add_summary(result[1], itr)
-            postlosses.append(result[-1])
+            postlosses.append(result[-3])
 
         if (itr!=0) and itr % PRINT_INTERVAL == 0:
             if itr < FLAGS.pretrain_iterations:
                 print_str = 'Pretrain Iteration ' + str(itr)
             else:
                 print_str = 'Iteration ' + str(itr - FLAGS.pretrain_iterations)
-            print_str += ': ' + str(np.mean(prelosses)) + ', ' + str(np.mean(postlosses))
-            print(print_str)
+            print_str += ': loss: ' + str(np.mean(prelosses)) + ', ' + str(np.mean(postlosses))
+            print(print_str+', accuracy: '+str(result[-2])+', '+str(result[-1]))
             prelosses, postlosses = [], []
 
         if (itr!=0) and itr % SAVE_INTERVAL == 0:
@@ -108,11 +103,12 @@ def train(model, saver, sess, exp_string, data_generator, resume_itr=0):
                 input_tensors = [model.metaval_total_loss1, model.metaval_total_losses2[FLAGS.num_updates-1], model.summ_op]
             
             result = sess.run(input_tensors, feed_dict)
-            print('Validation results: ' + str(result[0]) + ', ' + str(result[1]))
+            print('Validation accuracy results: ' + str(result[0]) + ', ' + str(result[1]))
 
     saver.save(sess, FLAGS.logdir + '/' + exp_string +  '/model' + str(itr))
+    print("training finished")
+    #sess.close()
 
-# calculated for omniglot
 NUM_TEST_POINTS = 600
 
 def test(model, saver, sess, exp_string, data_generator, test_num_updates=None):
@@ -123,15 +119,15 @@ def test(model, saver, sess, exp_string, data_generator, test_num_updates=None):
 
     metaval_accuracies = []
 
-    for _ in range(NUM_TEST_POINTS):
+    for itr in range(NUM_TEST_POINTS):
         
-        feed_dict = {}
         feed_dict = {model.meta_lr : 0.0}
         
         if model.classification:
             result = sess.run([model.metaval_total_accuracy1] + model.metaval_total_accuracies2, feed_dict)
         else:  # this is for sinusoid
             result = sess.run([model.total_loss1] +  model.total_losses2, feed_dict)
+
         metaval_accuracies.append(result)
 
     metaval_accuracies = np.array(metaval_accuracies)
@@ -154,24 +150,22 @@ def test(model, saver, sess, exp_string, data_generator, test_num_updates=None):
         writer.writerow(ci95)
 
 def main():
-    meta_train_task_index_map = {}
+    meta_train_tasks = []
     with open(FLAGS.meta_train_tasks,'r') as f:
-        task_list = f.readlines()
-        for i,task in enumerate(task_list):
-            meta_train_task_index_map[task.strip()]=i
+        for task in f:
+            meta_train_tasks.append(task.strip())
 
-    meta_test_task_index_map = {}
+    meta_test_tasks = []
     with open(FLAGS.meta_test_tasks,'r') as f:
-        task_list = f.readlines()
-        for i,task in enumerate(task_list):
-            meta_test_task_index_map[task.strip()]=i
+        for task in f:
+            meta_test_tasks.append(task.strip())
 
-    #print("meta_train_tast_index_map\n",meta_train_tast_index_map)
-    #print("meta_test_tast_index_map\n",meta_test_tast_index_map)
+    #print("meta_train_tasks\n",meta_train_tasks)
+    #print("meta_test_tasks\n",meta_test_tasks)
 
 
     bert_config = bert_modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
-    sentence_embedding_size = bert_config.hidden_size
+    word_embedding_size = bert_config.hidden_size
     #print("sentence_embedding_size: ",sentence_embedding_size)
 
     if FLAGS.train == True:
@@ -185,38 +179,33 @@ def main():
         FLAGS.meta_batch_size = 1
 
     if FLAGS.train:
-        data_generator = DataGenerator(FLAGS.meta_batch_size, meta_train_task_index_map)  # only use one datapoint for testing to save memory
+        data_generator = DataGenerator(FLAGS.meta_batch_size, meta_train_tasks, FLAGS.update_batch_size*2, word_embedding_size)
     else:
-        data_generator = DataGenerator(FLAGS.meta_batch_size, meta_test_task_index_map)  # only use one datapoint for testing to save memory
-
+        data_generator = DataGenerator(FLAGS.meta_batch_size, meta_test_tasks, FLAGS.update_batch_size*2, word_embedding_size)
     
     dim_output = data_generator.dim_output
     #print("dim_output: ", dim_output)
     tf_data_load = True
     num_classes = data_generator.num_classes
-
+    
     if FLAGS.train: # only construct training model if needed
         random.seed(5) 
-        inputa, labela, inputb, labelb = data_generator.make_data_tensor(FLAGS.update_batch_size, 10)
-        #inputa = tf.slice(sentence_tensor, [0,0,0], [-1,num_classes*FLAGS.update_batch_size, -1])
-        #inputb = tf.slice(sentence_tensor, [0,num_classes*FLAGS.update_batch_size, 0], [-1,-1,-1])
-        #labela = tf.slice(label_tensor, [0,0,0], [-1,num_classes*FLAGS.update_batch_size, -1])
-        #labelb = tf.slice(label_tensor, [0,num_classes*FLAGS.update_batch_size, 0], [-1,-1,-1])
-        print("inputa: ", inputa.shape)
-        print("inputb: ", inputb.shape)
-        print("labela: ", labela.shape)
-        print("labelb: ", labelb.shape)
+        sentence_tensor, label_tensor = data_generator.make_data_tensor()
+        inputa = tf.slice(sentence_tensor, [0,0,0,0], [-1,num_classes*FLAGS.update_batch_size, -1, -1])
+        inputb = tf.slice(sentence_tensor, [0,num_classes*FLAGS.update_batch_size, 0, 0], [-1,-1,-1, -1])
+        labela = tf.slice(label_tensor, [0,0], [-1,num_classes*FLAGS.update_batch_size])
+        labelb = tf.slice(label_tensor, [0,num_classes*FLAGS.update_batch_size], [-1,-1])
         input_tensors = {'inputa': inputa, 'inputb': inputb, 'labela': labela, 'labelb': labelb}
     
     random.seed(6)
-    inputa, labela, inputb, labelb = data_generator.make_data_tensor(3, 3, train=False)
-    #inputa = tf.slice(sentence_tensor, [0,0,0], [-1,num_classes*FLAGS.update_batch_size, -1])
-    #inputb = tf.slice(sentence_tensor, [0,num_classes*FLAGS.update_batch_size, 0], [-1,-1,-1])
-    #labela = tf.slice(label_tensor, [0,0,0], [-1,num_classes*FLAGS.update_batch_size, -1])
-    #labelb = tf.slice(label_tensor, [0,num_classes*FLAGS.update_batch_size, 0], [-1,-1,-1])
+    sentence_tensor, label_tensor = data_generator.make_data_tensor(train=False)
+    inputa = tf.slice(sentence_tensor, [0,0,0,0], [-1,num_classes*FLAGS.update_batch_size, -1, -1])
+    inputb = tf.slice(sentence_tensor, [0,num_classes*FLAGS.update_batch_size, 0, 0], [-1,-1,-1, -1])
+    labela = tf.slice(label_tensor, [0,0], [-1,num_classes*FLAGS.update_batch_size])
+    labelb = tf.slice(label_tensor, [0,num_classes*FLAGS.update_batch_size], [-1,-1])
     metaval_input_tensors = {'inputa': inputa, 'inputb': inputb, 'labela': labela, 'labelb': labelb}
     
-    model = MAML(sentence_embedding_size, dim_output, test_num_updates=test_num_updates)
+    model = MAML(word_embedding_size, dim_output, test_num_updates=test_num_updates)
     if FLAGS.train or not tf_data_load:
         model.construct_model(input_tensors=input_tensors, bert_config=bert_config, prefix='metatrain_')
     if tf_data_load:
@@ -228,7 +217,6 @@ def main():
     sess = tf.InteractiveSession()
 
     tvars = tf.trainable_variables()
-    print(tvars)
 
     if FLAGS.train == False:
         # change to original meta batch size when loading model.
@@ -239,30 +227,18 @@ def main():
     if FLAGS.train_update_lr == -1:
         FLAGS.train_update_lr = FLAGS.update_lr
 
-    exp_string = 'cls_'+str(FLAGS.num_classes)+'.mbs_'+str(FLAGS.meta_batch_size) + '.ubs_' + str(FLAGS.train_update_batch_size) + '.numstep' + str(FLAGS.num_updates) + '.updatelr' + str(FLAGS.train_update_lr)
-    '''
-    if FLAGS.num_filters != 64:
-        exp_string += 'hidden' + str(FLAGS.num_filters)
-    if FLAGS.max_pool:
-        exp_string += 'maxpool'
-    if FLAGS.stop_grad:
-        exp_string += 'stopgrad'
-    if FLAGS.baseline:
-        exp_string += FLAGS.baseline
+    exp_string = 'cls_'+str(FLAGS.num_classes) \
+                +'.mbs_'+str(FLAGS.meta_batch_size) \
+                + '.ubs_' + str(FLAGS.train_update_batch_size) \
+                + '.numstep' + str(FLAGS.num_updates) \
+                + '.updatelr' + str(FLAGS.train_update_lr) \
+                + '.numtransformer' + str(FLAGS.num_transformer)
     
-    if FLAGS.norm == 'batch_norm':
-        exp_string += 'batchnorm'
-    elif FLAGS.norm == 'layer_norm':
-        exp_string += 'layernorm'
-    elif FLAGS.norm == 'None':
-        exp_string += 'nonorm'
-    else:
-        print('Norm setting not recognized.')
-    '''
     resume_itr = 0
     model_file = None
 
     tf.global_variables_initializer().run()
+    tf.local_variables_initializer().run()
     tf.train.start_queue_runners()
 
     if FLAGS.resume or not FLAGS.train:

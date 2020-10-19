@@ -34,12 +34,18 @@ import pathlib
 import collections
 import random
 import numpy as np
+FLAGS = flags.FLAGS
 
 from bert_serving.client import BertClient
+from bert_serving.server.helper import get_args_parser
+from bert_serving.server import BertServer
+args = get_args_parser().parse_args(['-model_dir', './checkpoint/uncased_L-12_H-768_A-12',
+                                     '-num_worker', '1',
+                                     '-max_seq_len', '50',
+                                     '-pooling_strategy', 'NONE'])
+server = BertServer(args)
+server.start()
 bert_client = BertClient()
-
-
-FLAGS = flags.FLAGS
 
 
 class DataGenerator(object):
@@ -47,7 +53,7 @@ class DataGenerator(object):
     Data Generator capable of generating batches of sinusoid or Omniglot data.
     A "class" is considered a class of omniglot digits or a particular sinusoid function.
     """
-    def __init__(self, batch_size, task_index_map,config={}):
+    def __init__(self, batch_size, tasks, num_samples_per_class, word_embedding_size, config={}):
         """
         Args:
             num_samples_per_class: num samples to generate per class in one batch
@@ -55,42 +61,41 @@ class DataGenerator(object):
             task_index_map
         """
         self.batch_size = batch_size
-        #self.num_samples_per_class = num_samples_per_class
+        self.num_samples_per_class = num_samples_per_class
         #self.test_samples_per_class = test_samples_per_class
         self.num_classes = 1  # by default 1 (only relevant for classification problems)
-        self.task_index_map = task_index_map
-        
+        self.tasks = tasks
+        print("tasks: ", tasks)
         self.num_classes = config.get('num_classes', FLAGS.num_classes)
-        #self.hidden_size = config.get('hidden_size', FLAGS.hidden_size)
+        self.word_embedding_size = word_embedding_size
         self.dim_output = self.num_classes
-        metatrain_folder = config.get('metatrain_folder', './data/train')
-        if FLAGS.test_set:
-            metaval_folder = config.get('metaval_folder', './data/test')
+        metatrain_folder = config.get('metatrain_folder', './data/train_domain')
+        if FLAGS.test:
+            metaval_folder = config.get('metaval_folder', './data/test_domain')
         else:
-            metaval_folder = config.get('metaval_folder', './data/dev')
+            metaval_folder = config.get('metaval_folder', './data/dev_domain')
 
         metatrain_folders = [os.path.join(metatrain_folder, label) \
                 for label in os.listdir(metatrain_folder) \
-                if label in self.task_index_map \
+                if label.split('.')[0] in self.tasks \
                 ]
 
         metaval_folders = [os.path.join(metaval_folder, label) \
                 for label in os.listdir(metaval_folder) \
-                if label in self.task_index_map \
+                if label.split('.')[0] in self.tasks \
                 ]
         self.metatrain_character_folders = metatrain_folders
         self.metaval_character_folders = metaval_folders
         
 
-    def make_data_tensor(self, num_samples_per_class, test_samples_per_class, train=True):
+    def make_data_tensor(self, train=True):
         if train:
             folders = self.metatrain_character_folders
-            # number of tasks, not number of meta-iterations. (divide by metabatch size to measure)
-            num_total_batches = 200
+            num_total_batches = 10
             print("num_total_batches: ", num_total_batches)
         else:
             folders = self.metaval_character_folders
-            num_total_batches = 600
+            num_total_batches = 10
 
         all_sentences = []
         all_labels = []
@@ -99,28 +104,33 @@ class DataGenerator(object):
         for _ in range(num_total_batches):
             sampled_character_folders = random.sample(folders, self.batch_size)
             random.shuffle(sampled_character_folders)
-            #print("sampled_character_folders: ", sampled_character_folders)
-            sentence_embedding, labels, test_sentence_embedding, test_label_list = self.collect_batch_sentence_embedding(sampled_character_folders, num_samples_per_class, test_samples_per_class,)
-            #print("sentence_embedding_shape: ",sentence_embedding.shape)
-            #print("labels_shape: ",labels.shape)
-            # make sure the above isn't randomized order
-            all_sentences.append(sentence_embedding)
-            all_labels.append(labels)
-            all_test_sentences.append(test_sentence_embedding)
-            all_test_labels.append(test_label_list)
+            sentence_embedding, labels = self.collect_batch_sentence_embedding(sampled_character_folders, self.num_samples_per_class)
+            all_sentences.extend(sentence_embedding)
+            all_labels.extend(labels)
+            
+        all_sentences = np.array(all_sentences)
+        all_labels = np.array(all_labels)
+        
+        input_queue = tf.train.slice_input_producer([all_sentences, all_labels],shuffle=False)
+        num_preprocess_threads = 1 # TODO - enable this to be set to >1
+        min_queue_examples = 256
+        batch_sentence_size = self.batch_size * self.num_classes * self.num_samples_per_class
+        sentence_batch, label_batch = tf.train.batch(
+                input_queue,
+                batch_size = batch_sentence_size,
+                num_threads=num_preprocess_threads,
+                capacity=min_queue_examples + 3 * batch_sentence_size,
+                )
+        
+        #label_batch = tf.one_hot(label_batch, self.num_classes)
+        sentence_batch = tf.reshape(sentence_batch, [self.batch_size, self.num_classes * self.num_samples_per_class, FLAGS.max_seq_len, self.word_embedding_size])
+        label_batch = tf.reshape(label_batch, [self.batch_size, self.num_classes * self.num_samples_per_class])
+        
+        return sentence_batch, label_batch
 
-        all_sentences_batches = tf.stack(all_sentences) #[num_total_batches, task_per_batch * num_class * sample_per_class, seq_len, embedding_size]
-        all_label_batches = tf.stack(all_labels) 
-        all_label_batches = tf.one_hot(all_label_batches, self.num_classes)
-        all_test_sentences_batches = tf.stack(all_test_sentences) #[num_total_batches, task_per_batch * num_class * test_sample_per_class, seq_len, embedding_size]
-        all_test_label_batches = tf.stack(all_test_labels) 
-        all_test_label_batches = tf.one_hot(all_test_label_batches, self.num_classes)
-        return all_sentences_batches, all_label_batches, all_test_sentences_batches, all_test_label_batches
 
-
-    def collect_batch_sentence_embedding(self, sampled_character_folders, num_samples_per_class, test_samples_per_class,):
+    def collect_batch_sentence_embedding(self, sampled_character_folders, num_samples_per_class):
         support_set = []
-        test_support_set = []
         for file in sampled_character_folders:
             task_support_set = []
             sample_pool = {'1': [], '-1':[]}
@@ -129,36 +139,23 @@ class DataGenerator(object):
                     text, label = line.strip().split('\t')
                     sample_pool[str(label)].append(text)
                 #print(file, len(sample_pool['1']), len(sample_pool['-1']))
+                if (len(sample_pool['-1']) < num_samples_per_class) or (len(sample_pool['1']) < num_samples_per_class):
+                    print("num_samples_per_class > #samples in this file: ", file)
                 pos_sample = random.sample(sample_pool['1'], num_samples_per_class)
-                if num_samples_per_class > len(sample_pool['-1']) or num_samples_per_class < 1:
-                    print("random.sample Error: ", file)
-                    print("self.num_samples_per_class: ", num_samples_per_class)
-                    print("len(sample_pool['-1']): ",len(sample_pool['-1']))
                 neg_sample = random.sample(sample_pool['-1'], num_samples_per_class)
                 task_support_set.extend([(s,1) for s in pos_sample]) 
                 task_support_set.extend([(s,0) for s in neg_sample]) 
                 random.shuffle(task_support_set)
                 support_set.extend(task_support_set)
-
-                pos_test_sample = random.sample(sample_pool['1'], test_samples_per_class)
-                neg_test_sample = random.sample(sample_pool['-1'], test_samples_per_class)
-                test_support_set.extend([(s,1) for s in pos_test_sample]) 
-                test_support_set.extend([(s,0) for s in neg_test_sample]) 
-
+                
+        random.shuffle(support_set)
         text_list = [s for (s,l) in support_set]
         label_list = [l for (s,l) in support_set]
-        #print("label_list:\n", label_list)
-        sentence_embedding = tf.convert_to_tensor(bert_client.encode(text_list)) #[task_per_batch * num_class * sample_per_class, seq_len, embedding_size]
-        label_list = tf.convert_to_tensor(label_list) #task_per_batch * num_class * sample_per_class
-        
-        test_text_list = [s for (s,l) in test_support_set]
-        test_label_list = [l for (s,l) in test_support_set]
-        #print("label_list:\n", label_list)
-        test_sentence_embedding = tf.convert_to_tensor(bert_client.encode(test_text_list)) #[task_per_batch * num_class * sample_per_class, seq_len, embedding_size]
-        test_label_list = tf.convert_to_tensor(test_label_list) #task_per_batch * num_class * sample_per_class
+        #print("bert_client encoding")
+        sentence_embedding = bert_client.encode(text_list) #[task_per_batch * num_class * sample_per_class, seq_len, embedding_size]
         
 
-        return sentence_embedding, label_list, test_sentence_embedding, test_label_list
+        return sentence_embedding, label_list
 
 
 

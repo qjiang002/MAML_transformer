@@ -43,10 +43,10 @@ class MAML:
     def construct_model(self, input_tensors=None, bert_config={}, prefix='metatrain_'):
         # a: training data for inner gradient, b: test data for meta gradient
         if input_tensors is None:
-            self.inputa = tf.placeholder(tf.float32)
-            self.inputb = tf.placeholder(tf.float32)
-            self.labela = tf.placeholder(tf.float32)
-            self.labelb = tf.placeholder(tf.float32)
+            self.inputa = tf.placeholder(dtype=tf.float32, shape=(FLAGS.meta_batch_size, self.dim_output*FLAGS.update_batch_size, 50, bert_config.hidden_size), name='inputa')
+            self.inputb = tf.placeholder(dtype=tf.float32, shape=(FLAGS.meta_batch_size, None, 50, bert_config.hidden_size), name='inputb')
+            self.labela = tf.placeholder(dtype=tf.int64, shape=(FLAGS.meta_batch_size, self.dim_output*FLAGS.update_batch_size), name='labela')
+            self.labelb = tf.placeholder(dtype=tf.int64, shape=(FLAGS.meta_batch_size, None), name='labelb')
         else:
             self.inputa = input_tensors['inputa']
             self.inputb = input_tensors['inputb']
@@ -70,7 +70,7 @@ class MAML:
             accuraciesb = [[]]*num_updates
 
             def task_metalearn(inp,reuse=True):
-                print("enter task_metalearn")
+                #print("enter task_metalearn")
                 """ Perform gradient descent for one task in the meta-batch. """
                 inputa, inputb, labela, labelb = inp
                 task_outputbs, task_lossesb = [], []
@@ -106,16 +106,16 @@ class MAML:
                 task_output = [task_outputa, task_outputbs, task_lossa, task_lossesb]
 
                 if self.classification:
-                    task_accuracya = tf.contrib.metrics.accuracy(tf.argmax(tf.nn.softmax(task_outputa), 1), tf.argmax(labela, 1))
+                    task_accuracya = tf.contrib.metrics.accuracy(predictions=tf.argmax(task_outputa, axis=-1), labels=tf.argmax(labela, axis=-1))
                     for j in range(num_updates):
-                        task_accuraciesb.append(tf.contrib.metrics.accuracy(tf.argmax(tf.nn.softmax(task_outputbs[j]), 1), tf.argmax(labelb, 1)))
+                        task_accuraciesb.append(tf.contrib.metrics.accuracy(predictions=tf.argmax(task_outputbs[j], axis=-1), labels=tf.argmax(labelb, axis=-1)))
                     task_output.extend([task_accuracya, task_accuraciesb])
 
-                return task_output
+                return task_output 
 
-            if FLAGS.norm is not 'None':
+            #if FLAGS.norm is not 'None':
                 # to initialize the batch norm vars, might want to combine this, and not run idx 0 twice.
-                unused = task_metalearn((self.inputa[0], self.inputb[0], self.labela[0], self.labelb[0]), False)
+                #unused = task_metalearn((self.inputa[0], self.inputb[0], self.labela[0], self.labelb[0]), False)
 
             out_dtype = [tf.float32, [tf.float32]*num_updates, tf.float32, [tf.float32]*num_updates]
             if self.classification:
@@ -182,9 +182,9 @@ class MAML:
         probabilities = tf.nn.softmax(logits, axis=-1)
         log_probs = tf.nn.log_softmax(logits, axis=-1)
 
-        #one_hot_labels = tf.one_hot(labels, depth=num_labels, dtype=tf.float32)
+        one_hot_labels = tf.one_hot(label, depth=self.dim_output, dtype=tf.float32)
 
-        per_example_loss = -tf.reduce_sum(label * log_probs, axis=-1)
+        per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
         loss = tf.reduce_mean(per_example_loss)
 
         return loss
@@ -216,7 +216,7 @@ class MAML:
         return weights
 
     def forward_transformer(self, inp, weights, config, is_training, reuse=False): # inp = [batch_size, seq_length, hidden_size]
-        print("enter forward_transformer")
+        #print("enter forward_transformer")
         if not is_training:
             config.hidden_dropout_prob = 0.0
             config.attention_probs_dropout_prob = 0.0
