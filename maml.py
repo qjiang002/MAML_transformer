@@ -3,6 +3,8 @@ from __future__ import print_function
 import numpy as np
 import sys
 import math
+import copy
+import six
 import tensorflow as tf
 try:
     import special_grads
@@ -12,104 +14,130 @@ except KeyError as e:
 
 from tensorflow.python.platform import flags
 from utils import mse, xent, conv_block, normalize
-from bert.modeling import create_attention_mask_from_input_mask
-from bert.modeling import transformer_model
+from bert import modeling
 
 
 FLAGS = flags.FLAGS
 
 class MAML:
-    def __init__(self, dim_input=1, dim_output=1, test_num_updates=5):
+    def __init__(self, config_file, meta_batch_size, support_samples_per_class, query_samples_per_class, max_seq_len, meta_lr, update_lr, num_updates, num_classes):
         """ must call construct_model() after initializing MAML! """
-        self.dim_input = dim_input
-        self.dim_output = dim_output
-        self.update_lr = FLAGS.update_lr
-        self.meta_lr = tf.placeholder_with_default(FLAGS.meta_lr, ())
-        self.classification = True
-        self.test_num_updates = test_num_updates
+        self.config = modeling.BertConfig.from_json_file(config_file)
+        self.meta_batch_size = meta_batch_size
+        self.update_lr = tf.placeholder_with_default(update_lr, ())
+        self.meta_lr = tf.placeholder_with_default(meta_lr, ())
+        self.support_samples_per_class = support_samples_per_class
+        self.query_samples_per_class = query_samples_per_class
+        self.num_updates = num_updates
+        self.max_seq_len = max_seq_len
+        self.num_classes = num_classes
         #self.loss_func = xent
-        if FLAGS.use_transformer:
-            self.dim_hidden = FLAGS.num_transformer
-            self.forward = self.forward_transformer
-            self.construct_weights = self.construct_transformer_weights
-            self.loss_func = self.loss_func_transformer
-        else:
-            self.dim_hidden = [256, 128, 64, 64]
-            self.forward=self.forward_fc
-            self.construct_weights = self.construct_fc_weights
-            self.loss_func = xent
+
+        self.forward = self.forward_transformer
+        self.construct_weights = self.construct_transformer_weights
+        self.loss_func = self.loss_func_transformer
 
 
-    def construct_model(self, input_tensors=None, bert_config={}, prefix='metatrain_'):
+
+    def construct_model(self, is_training=True):
         # a: training data for inner gradient, b: test data for meta gradient
-        if input_tensors is None:
-            self.inputa = tf.placeholder(dtype=tf.float32, shape=(FLAGS.meta_batch_size, self.dim_output*FLAGS.update_batch_size, 50, bert_config.hidden_size), name='inputa')
-            self.inputb = tf.placeholder(dtype=tf.float32, shape=(FLAGS.meta_batch_size, None, 50, bert_config.hidden_size), name='inputb')
-            self.labela = tf.placeholder(dtype=tf.int64, shape=(FLAGS.meta_batch_size, self.dim_output*FLAGS.update_batch_size), name='labela')
-            self.labelb = tf.placeholder(dtype=tf.int64, shape=(FLAGS.meta_batch_size, None), name='labelb')
-        else:
-            self.inputa = input_tensors['inputa']
-            self.inputb = input_tensors['inputb']
-            self.labela = input_tensors['labela']
-            self.labelb = input_tensors['labelb']
+        
 
+        #self.single_batch_input_ids = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*(self.support_samples_per_class+self.query_samples_per_class), self.max_seq_len), name='single_batch_input_ids')
+        #self.single_batch_segment_ids = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*(self.support_samples_per_class+self.query_samples_per_class), self.max_seq_len), name='single_batch_segment_ids')
+        #self.single_batch_input_mask = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*(self.support_samples_per_class+self.query_samples_per_class), self.max_seq_len), name='single_batch_input_mask')
+        #self.single_batch_labels = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*(self.support_samplt_samples_per_class+self.query_sames_per_class+self.query_samples_per_class)), name='single_batch_labels')
+        self.input_ids_support = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*self.support_samples_per_class, self.max_seq_len), name='input_ids_support')
+        self.input_ids_query = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*self.query_samples_per_class, self.max_seq_len), name='input_ids_query')
+        self.segment_ids_support = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*self.support_samples_per_class, self.max_seq_len), name='segment_ids_support')
+        self.segment_ids_query = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*self.query_samples_per_class, self.max_seq_len), name='segment_ids_query')
+        self.input_mask_support = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*self.support_samples_per_class, self.max_seq_len), name='input_mask_support')
+        self.input_mask_query = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*self.query_samples_per_class, self.max_seq_len), name='input_mask_query')
+        self.labels_support = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*self.support_samples_per_class), name='labels_support')
+        self.labels_query = tf.placeholder(dtype=tf.int64, shape=(self.meta_batch_size, self.num_classes*self.query_samples_per_class), name='labels_query')
+        
         with tf.variable_scope('model', reuse=None) as training_scope:
             if 'weights' in dir(self):
                 training_scope.reuse_variables()
                 weights = self.weights
             else:
                 # Define the weights
-                self.weights = weights = self.construct_weights(hidden_size=bert_config.hidden_size, num_attention_heads=bert_config.num_attention_heads, intermediate_size=bert_config.intermediate_size, initializer_range=bert_config.initializer_range)
+                self.weights = weights = self.construct_weights(config=self.config)
 
             # outputbs[i] and lossesb[i] is the output and loss after i+1 gradient updates
             lossesa, outputas, lossesb, outputbs = [], [], [], []
             accuraciesa, accuraciesb = [], []
-            num_updates = max(self.test_num_updates, FLAGS.num_updates)
-            outputbs = [[]]*num_updates
-            lossesb = [[]]*num_updates
-            accuraciesb = [[]]*num_updates
+            outputbs = [[]]*self.num_updates
+            lossesb = [[]]*self.num_updates
+            accuraciesb = [[]]*self.num_updates
 
-            def task_metalearn(inp,reuse=True):
+            def task_metalearn(inp):
                 #print("enter task_metalearn")
                 """ Perform gradient descent for one task in the meta-batch. """
-                inputa, inputb, labela, labelb = inp
-                task_outputbs, task_lossesb = [], []
+                #input_ids, segment_ids, input_mask, labels = inp
+                task_outputbs, task_lossesb, task_accuraciesb = [], [], []
+                input_ids_support, input_ids_query, segment_ids_support, segment_ids_query, input_mask_support, input_mask_query, labels_support, labels_query = inp
+                '''
+                input_ids_support = tf.slice(input_ids, [0,0], [self.num_classes*self.support_samples_per_class, -1])
+                input_ids_query = tf.slice(input_ids, [self.num_classes*self.support_samples_per_class,0], [-1, -1])
+                segment_ids_support = tf.slice(segment_ids, [0,0], [self.num_classes*self.support_samples_per_class, -1])
+                segment_ids_query = tf.slice(segment_ids, [self.num_classes*self.support_samples_per_class,0], [-1, -1])
+                input_mask_support = tf.slice(input_mask, [0,0], [self.num_classes*self.support_samples_per_class, -1])
+                input_mask_query = tf.slice(input_mask, [self.num_classes*self.support_samples_per_class,0], [-1, -1])
+                labels_support = tf.slice(labels, [0], [self.num_classes*self.support_samples_per_class])
+                labels_query = tf.slice(labels, [self.num_classes*self.support_samples_per_class], [-1])
+                '''
 
-                if self.classification:
-                    task_accuraciesb = []
-
-                is_training = True if 'train' in prefix else False
-
-                task_outputa = self.forward(inputa, weights, bert_config, is_training=is_training, reuse=reuse)  # only reuse on the first iter
-                task_lossa = self.loss_func(task_outputa, labela)
+                task_outputa = self.forward(input_ids=input_ids_support, 
+                                            input_mask=input_mask_support, 
+                                            token_type_ids=segment_ids_support, 
+                                            weights=weights, 
+                                            config=self.config, 
+                                            is_training=is_training)
+                task_lossa = self.loss_func(task_outputa, labels_support)
 
                 grads = tf.gradients(task_lossa, list(weights.values()))
-                if FLAGS.stop_grad:
-                    grads = [tf.stop_gradient(grad) for grad in grads]
+                #if FLAGS.stop_grad:
+                #    grads = [tf.stop_gradient(grad) for grad in grads]
                 gradients = dict(zip(weights.keys(), grads))
+                
                 fast_weights = dict(zip(weights.keys(), [weights[key] - self.update_lr*gradients[key] for key in weights.keys()])) #temporary weights
-                output = self.forward(inputb, fast_weights, bert_config, is_training=is_training, reuse=True)
+                output = self.forward(input_ids=input_ids_query, 
+                                            input_mask=input_mask_query, 
+                                            token_type_ids=segment_ids_query,  
+                                            weights=fast_weights, 
+                                            config=self.config, 
+                                            is_training=is_training)
                 task_outputbs.append(output)
-                task_lossesb.append(self.loss_func(output, labelb))
+                task_lossesb.append(self.loss_func(output, labels_query))
 
-                for j in range(num_updates - 1):
-                    loss = self.loss_func(self.forward(inputa, fast_weights, bert_config, is_training=is_training, reuse=True), labela)
+                for j in range(self.num_updates - 1):
+                    loss = self.loss_func(self.forward(input_ids=input_ids_support, 
+                                            input_mask=input_mask_support, 
+                                            token_type_ids=segment_ids_support, 
+                                            weights=fast_weights, 
+                                            config=self.config, 
+                                            is_training=is_training), labels_support)
                     grads = tf.gradients(loss, list(fast_weights.values()))
-                    if FLAGS.stop_grad:
-                        grads = [tf.stop_gradient(grad) for grad in grads]
+                    #if FLAGS.stop_grad:
+                    #    grads = [tf.stop_gradient(grad) for grad in grads]
                     gradients = dict(zip(fast_weights.keys(), grads))
                     fast_weights = dict(zip(fast_weights.keys(), [fast_weights[key] - self.update_lr*gradients[key] for key in fast_weights.keys()]))
-                    output = self.forward(inputb, fast_weights, bert_config, is_training=is_training, reuse=True)
+                    output = self.forward(input_ids=input_ids_query, 
+                                            input_mask=input_mask_query, 
+                                            token_type_ids=segment_ids_query, 
+                                            weights=fast_weights, 
+                                            config=self.config, 
+                                            is_training=is_training)
                     task_outputbs.append(output)
-                    task_lossesb.append(self.loss_func(output, labelb))
+                    task_lossesb.append(self.loss_func(output, labels_query))
 
                 task_output = [task_outputa, task_outputbs, task_lossa, task_lossesb]
 
-                if self.classification:
-                    task_accuracya = tf.contrib.metrics.accuracy(predictions=tf.argmax(task_outputa, axis=-1), labels=tf.argmax(labela, axis=-1))
-                    for j in range(num_updates):
-                        task_accuraciesb.append(tf.contrib.metrics.accuracy(predictions=tf.argmax(task_outputbs[j], axis=-1), labels=tf.argmax(labelb, axis=-1)))
-                    task_output.extend([task_accuracya, task_accuraciesb])
+                task_accuracya = tf.contrib.metrics.accuracy(predictions=tf.argmax(task_outputa, axis=-1), labels=labels_support)
+                for j in range(self.num_updates):
+                    task_accuraciesb.append(tf.contrib.metrics.accuracy(predictions=tf.argmax(task_outputbs[j], axis=-1), labels=labels_query))
+                task_output.extend([task_accuracya, task_accuraciesb])
 
                 return task_output 
 
@@ -117,84 +145,70 @@ class MAML:
                 # to initialize the batch norm vars, might want to combine this, and not run idx 0 twice.
                 #unused = task_metalearn((self.inputa[0], self.inputb[0], self.labela[0], self.labelb[0]), False)
 
-            out_dtype = [tf.float32, [tf.float32]*num_updates, tf.float32, [tf.float32]*num_updates]
-            if self.classification:
-                out_dtype.extend([tf.float32, [tf.float32]*num_updates])
-            result = tf.map_fn(task_metalearn, elems=(self.inputa, self.inputb, self.labela, self.labelb), dtype=out_dtype, parallel_iterations=FLAGS.meta_batch_size)
-            if self.classification:
-                outputas, outputbs, lossesa, lossesb, accuraciesa, accuraciesb = result
-            else:
-                outputas, outputbs, lossesa, lossesb  = result
+            out_dtype = [tf.float32, [tf.float32]*self.num_updates, tf.float32, [tf.float32]*self.num_updates, tf.float32, [tf.float32]*self.num_updates]
+            
+            result = tf.map_fn(task_metalearn, elems=(self.input_ids_support, self.input_ids_query, self.segment_ids_support, self.segment_ids_query, self.input_mask_support, self.input_mask_query, self.labels_support, self.labels_query), dtype=out_dtype, parallel_iterations=self.meta_batch_size)
+            outputas, outputbs, lossesa, lossesb, accuraciesa, accuraciesb = result
+            
 
         ## Performance & Optimization
-        if 'train' in prefix:
-            self.total_loss1 = total_loss1 = tf.reduce_sum(lossesa) / tf.to_float(FLAGS.meta_batch_size)
-            self.total_losses2 = total_losses2 = [tf.reduce_sum(lossesb[j]) / tf.to_float(FLAGS.meta_batch_size) for j in range(num_updates)]
+        if is_training:
+            self.total_loss1 = total_loss1 = tf.reduce_sum(lossesa) / tf.to_float(self.meta_batch_size)
+            self.total_losses2 = total_losses2 = [tf.reduce_sum(lossesb[j]) / tf.to_float(self.meta_batch_size) for j in range(self.num_updates)]
             # after the map_fn
             self.outputas, self.outputbs = outputas, outputbs
-            if self.classification:
-                self.total_accuracy1 = total_accuracy1 = tf.reduce_sum(accuraciesa) / tf.to_float(FLAGS.meta_batch_size)
-                self.total_accuracies2 = total_accuracies2 = [tf.reduce_sum(accuraciesb[j]) / tf.to_float(FLAGS.meta_batch_size) for j in range(num_updates)]
+            self.total_accuracy1 = total_accuracy1 = tf.reduce_sum(accuraciesa) / tf.to_float(self.meta_batch_size)
+            self.total_accuracies2 = total_accuracies2 = [tf.reduce_sum(accuraciesb[j]) / tf.to_float(self.meta_batch_size) for j in range(self.num_updates)]
             self.pretrain_op = tf.train.AdamOptimizer(self.meta_lr).minimize(total_loss1)
 
-            if FLAGS.metatrain_iterations > 0:
-                optimizer = tf.train.AdamOptimizer(self.meta_lr)
-                self.gvs = gvs = optimizer.compute_gradients(self.total_losses2[FLAGS.num_updates-1])
-                #if FLAGS.datasource == 'miniimagenet':
-                #    gvs = [(tf.clip_by_value(grad, -10, 10), var) for grad, var in gvs]
-                self.metatrain_op = optimizer.apply_gradients(gvs)
+            
+            optimizer = tf.train.AdamOptimizer(self.meta_lr)
+            self.gvs = gvs = optimizer.compute_gradients(self.total_losses2[self.num_updates-1])
+            self.metatrain_op = optimizer.apply_gradients(gvs)
         else:
-            self.metaval_total_loss1 = total_loss1 = tf.reduce_sum(lossesa) / tf.to_float(FLAGS.meta_batch_size)
-            self.metaval_total_losses2 = total_losses2 = [tf.reduce_sum(lossesb[j]) / tf.to_float(FLAGS.meta_batch_size) for j in range(num_updates)]
-            if self.classification:
-                self.metaval_total_accuracy1 = total_accuracy1 = tf.reduce_sum(accuraciesa) / tf.to_float(FLAGS.meta_batch_size)
-                self.metaval_total_accuracies2 = total_accuracies2 =[tf.reduce_sum(accuraciesb[j]) / tf.to_float(FLAGS.meta_batch_size) for j in range(num_updates)]
+            self.metaval_total_loss1 = total_loss1 = tf.reduce_sum(lossesa) / tf.to_float(self.meta_batch_size)
+            self.metaval_total_losses2 = total_losses2 = [tf.reduce_sum(lossesb[j]) / tf.to_float(self.meta_batch_size) for j in range(self.num_updates)]
+            self.metaval_total_accuracy1 = total_accuracy1 = tf.reduce_sum(accuraciesa) / tf.to_float(self.meta_batch_size)
+            self.metaval_total_accuracies2 = total_accuracies2 =[tf.reduce_sum(accuraciesb[j]) / tf.to_float(self.meta_batch_size) for j in range(self.num_updates)]
 
         ## Summaries
-        tf.summary.scalar(prefix+'Pre-update loss', total_loss1)
-        if self.classification:
-            tf.summary.scalar(prefix+'Pre-update accuracy', total_accuracy1)
+        tf.summary.scalar('Pre-update loss', total_loss1)
+        tf.summary.scalar('Pre-update accuracy', total_accuracy1)
 
-        for j in range(num_updates):
-            tf.summary.scalar(prefix+'Post-update loss, step ' + str(j+1), total_losses2[j])
-            if self.classification:
-                tf.summary.scalar(prefix+'Post-update accuracy, step ' + str(j+1), total_accuracies2[j])
-
-    ### Network construction functions (fc networks and conv networks)
-    def construct_fc_weights(self):
-        weights = {}
-        weights['w1'] = tf.Variable(tf.truncated_normal([self.dim_input, self.dim_hidden[0]], stddev=0.01))
-        weights['b1'] = tf.Variable(tf.zeros([self.dim_hidden[0]]))
-        for i in range(1,len(self.dim_hidden)):
-            weights['w'+str(i+1)] = tf.Variable(tf.truncated_normal([self.dim_hidden[i-1], self.dim_hidden[i]], stddev=0.01))
-            weights['b'+str(i+1)] = tf.Variable(tf.zeros([self.dim_hidden[i]]))
-        weights['w'+str(len(self.dim_hidden)+1)] = tf.Variable(tf.truncated_normal([self.dim_hidden[-1], self.dim_output], stddev=0.01))
-        weights['b'+str(len(self.dim_hidden)+1)] = tf.Variable(tf.zeros([self.dim_output]))
-        return weights
-
-    def forward_fc(self, inp, weights, reuse=False):
-        hidden = normalize(tf.matmul(inp, weights['w1']) + weights['b1'], activation=tf.nn.relu, reuse=reuse, scope='0')
-        for i in range(1,len(self.dim_hidden)):
-            hidden = normalize(tf.matmul(hidden, weights['w'+str(i+1)]) + weights['b'+str(i+1)], activation=tf.nn.relu, reuse=reuse, scope=str(i+1))
-        return tf.matmul(hidden, weights['w'+str(len(self.dim_hidden)+1)]) + weights['b'+str(len(self.dim_hidden)+1)]
+        for j in range(self.num_updates):
+            tf.summary.scalar('Post-update loss, step ' + str(j+1), total_losses2[j])
+            tf.summary.scalar('Post-update accuracy, step ' + str(j+1), total_accuracies2[j])
 
     def loss_func_transformer(self, logits, label):
         probabilities = tf.nn.softmax(logits, axis=-1)
         log_probs = tf.nn.log_softmax(logits, axis=-1)
 
-        one_hot_labels = tf.one_hot(label, depth=self.dim_output, dtype=tf.float32)
+        one_hot_labels = tf.one_hot(label, depth=self.num_classes, dtype=tf.float32)
 
         per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
         loss = tf.reduce_mean(per_example_loss)
 
         return loss
 
-    def construct_transformer_weights(self, hidden_size, num_attention_heads, intermediate_size, initializer_range):
+    def construct_transformer_weights(self, config):
+        hidden_size = config.hidden_size
+        num_attention_heads = config.num_attention_heads
+        intermediate_size = config.intermediate_size
+        initializer_range = config.initializer_range
+        vocab_size = config.vocab_size
+        type_vocab_size = config.type_vocab_size
+        max_position_embeddings = config.max_position_embeddings
+
         weights = {}
         dtype = tf.float32
         size_per_head = int(hidden_size/num_attention_heads)
 
-        for i in range(self.dim_hidden):
+        weights['word_embedding'] = tf.get_variable('word_embedding', [vocab_size, hidden_size], initializer=create_initializer(initializer_range))
+        weights['token_type_embedding'] = tf.get_variable('token_type_embedding', [type_vocab_size, hidden_size], initializer=create_initializer(initializer_range))
+        weights['position_embededing'] = tf.get_variable('position_embededing', [max_position_embeddings, hidden_size], initializer=create_initializer(initializer_range))
+        
+
+        for i in range(config.num_hidden_layers):
             transformer_name = 'transformer_'+str(i+1)
             weights[transformer_name+'_attention_layer_query_weight'] = tf.get_variable(transformer_name+'_attention_layer_query_weight', [hidden_size, num_attention_heads * size_per_head], initializer=create_initializer(initializer_range))
             weights[transformer_name+'_attention_layer_query_bias'] = tf.get_variable(transformer_name+'_attention_layer_query_bias', [num_attention_heads * size_per_head], initializer=tf.zeros_initializer())
@@ -211,38 +225,69 @@ class MAML:
         
         weights['pooler_weight'] = tf.get_variable('pooler_weight', [hidden_size, hidden_size], initializer=create_initializer(initializer_range))
         weights['pooler_bias'] = tf.get_variable('pooler_bias', [hidden_size], initializer=tf.zeros_initializer())
-        weights['output_weight'] = tf.get_variable('output_weight', [hidden_size, self.dim_output], initializer=create_initializer(initializer_range))
-        weights['output_bias'] = tf.get_variable('output_bias', [self.dim_output], initializer=tf.zeros_initializer())
+        weights['output_weight'] = tf.get_variable('output_weight', [hidden_size, self.num_classes], initializer=create_initializer(initializer_range))
+        weights['output_bias'] = tf.get_variable('output_bias', [self.num_classes], initializer=tf.zeros_initializer())
         return weights
 
-    def forward_transformer(self, inp, weights, config, is_training, reuse=False): # inp = [batch_size, seq_length, hidden_size]
+    def forward_transformer(self, input_ids, input_mask, token_type_ids, weights, config, is_training): # inp = [batch_size, seq_length, hidden_size]
         #print("enter forward_transformer")
+        config = copy.deepcopy(config)
         if not is_training:
             config.hidden_dropout_prob = 0.0
             config.attention_probs_dropout_prob = 0.0
-        input_shape = get_shape_list(inp, expected_rank=3)
+
+
+        input_shape = get_shape_list(input_ids, expected_rank=2)
         batch_size = input_shape[0]
         seq_length = input_shape[1]
-        hidden_size = input_shape[2]
-        input_mask = tf.ones(shape=[batch_size, seq_length], dtype=tf.int32)
-        
+
+        if input_mask is None:
+            input_mask = tf.ones(shape=[batch_size, seq_length], dtype=tf.int32)
+
+        if token_type_ids is None:
+            token_type_ids = tf.zeros(shape=[batch_size, seq_length], dtype=tf.int32)
+
+        embedding_output = embedding_lookup(
+            input_ids=input_ids,
+            weights=weights,
+            vocab_size=config.vocab_size,
+            embedding_size=config.hidden_size,
+            initializer_range=config.initializer_range,
+            word_embedding_name="word_embeddings",
+            use_one_hot_embeddings=False)
+
+        # Add positional embeddings and token type embeddings, then layer
+        # normalize and perform dropout.
+        embedding_output = embedding_postprocessor(
+            input_tensor=embedding_output,
+            weights=weights,
+            use_token_type=True,
+            token_type_ids=token_type_ids,
+            token_type_vocab_size=config.type_vocab_size,
+            token_type_embedding_name="token_type_embeddings",
+            use_position_embeddings=True,
+            position_embedding_name="position_embeddings",
+            initializer_range=config.initializer_range,
+            max_position_embeddings=config.max_position_embeddings,
+            dropout_prob=config.hidden_dropout_prob)
+
+
         attention_mask = create_attention_mask_from_input_mask(
-            inp, input_mask)
+            input_ids, input_mask)
 
         all_encoder_layers = transformer_model(
-            input_tensor=inp, #[batch_size, seq_length, hidden_size]
+            input_tensor=embedding_output, #[batch_size, seq_length, hidden_size]
             weights=weights,
             attention_mask=attention_mask,
             hidden_size=config.hidden_size,
-            num_hidden_layers=self.dim_hidden,
+            num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
             intermediate_size=config.intermediate_size,
-            intermediate_act_fn=config.hidden_act, #gelu
+            intermediate_act_fn=get_activation(config.hidden_act), #gelu
             hidden_dropout_prob=config.hidden_dropout_prob,
             attention_probs_dropout_prob=config.attention_probs_dropout_prob,
             initializer_range=config.initializer_range,
-            do_return_all_layers=True,
-            reuse=reuse)
+            do_return_all_layers=True)
         
         sequence_output = all_encoder_layers[-1]
         first_token_tensor = tf.squeeze(sequence_output[:, 0:1, :], axis=1) #[batch_size, hidden_size]
@@ -319,6 +364,43 @@ def reshape_from_matrix(output_tensor, orig_shape_list):
 
   return tf.reshape(output_tensor, orig_dims + [width])
 
+
+def get_activation(activation_string):
+  """Maps a string to a Python function, e.g., "relu" => `tf.nn.relu`.
+
+  Args:
+    activation_string: String name of the activation function.
+
+  Returns:
+    A Python function corresponding to the activation function. If
+    `activation_string` is None, empty, or "linear", this will return None.
+    If `activation_string` is not a string, it will return `activation_string`.
+
+  Raises:
+    ValueError: The `activation_string` does not correspond to a known
+      activation.
+  """
+
+  # We assume that anything that"s not a string is already an activation
+  # function, so we just return it.
+  if not isinstance(activation_string, six.string_types):
+    return activation_string
+
+  if not activation_string:
+    return None
+
+  act = activation_string.lower()
+  if act == "linear":
+    return None
+  elif act == "relu":
+    return tf.nn.relu
+  elif act == "gelu":
+    return gelu
+  elif act == "tanh":
+    return tf.tanh
+  else:
+    raise ValueError("Unsupported activation: %s" % act)
+
 def dropout(input_tensor, dropout_prob):
   """Perform dropout.
 
@@ -336,10 +418,18 @@ def dropout(input_tensor, dropout_prob):
   output = tf.nn.dropout(input_tensor, 1.0 - dropout_prob)
   return output
 
-def layer_norm(input_tensor, reuse=False, name=None):
+def layer_norm(input_tensor, name=None):
   """Run layer normalization on the last dimension of the tensor."""
   return tf.contrib.layers.layer_norm(
-      inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, reuse=tf.AUTO_REUSE, scope=name)
+      inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
+
+
+def layer_norm_and_dropout(input_tensor, dropout_prob, name=None):
+  """Runs layer normalization followed by dropout."""
+  output_tensor = layer_norm(input_tensor, name)
+  output_tensor = dropout(output_tensor, dropout_prob)
+  return output_tensor
+
 
 def gelu(x):
   """Gaussian Error Linear Unit.
@@ -356,6 +446,139 @@ def gelu(x):
       (np.sqrt(2 / np.pi) * (x + 0.044715 * tf.pow(x, 3)))))
   return x * cdf
 
+def embedding_lookup(input_ids,
+                     weights,
+                     vocab_size,
+                     embedding_size=128,
+                     initializer_range=0.02,
+                     word_embedding_name="word_embeddings",
+                     use_one_hot_embeddings=False):
+  """Looks up words embeddings for id tensor.
+
+  Args:
+    input_ids: int32 Tensor of shape [batch_size, seq_length] containing word
+      ids.
+    vocab_size: int. Size of the embedding vocabulary.
+    embedding_size: int. Width of the word embeddings.
+    initializer_range: float. Embedding initialization range.
+    word_embedding_name: string. Name of the embedding table.
+    use_one_hot_embeddings: bool. If True, use one-hot method for word
+      embeddings. If False, use `tf.gather()`.
+
+  Returns:
+    float Tensor of shape [batch_size, seq_length, embedding_size].
+  """
+  # This function assumes that the input is of shape [batch_size, seq_length,
+  # num_inputs].
+  #
+  # If the input is a 2D tensor of shape [batch_size, seq_length], we
+  # reshape to [batch_size, seq_length, 1].
+  if input_ids.shape.ndims == 2:
+    input_ids = tf.expand_dims(input_ids, axis=[-1])
+
+
+  flat_input_ids = tf.reshape(input_ids, [-1])
+  if use_one_hot_embeddings:
+    one_hot_input_ids = tf.one_hot(flat_input_ids, depth=vocab_size)
+    output = tf.matmul(one_hot_input_ids, weights['word_embedding'])
+  else:
+    output = tf.gather(weights['word_embedding'], flat_input_ids)
+
+  input_shape = get_shape_list(input_ids)
+
+  output = tf.reshape(output,
+                      input_shape[0:-1] + [input_shape[-1] * embedding_size])
+  return output
+
+def embedding_postprocessor(input_tensor,
+                            weights,
+                            use_token_type=False,
+                            token_type_ids=None,
+                            token_type_vocab_size=16,
+                            token_type_embedding_name="token_type_embeddings",
+                            use_position_embeddings=True,
+                            position_embedding_name="position_embeddings",
+                            initializer_range=0.02,
+                            max_position_embeddings=512,
+                            dropout_prob=0.1):
+  """Performs various post-processing on a word embedding tensor.
+
+  Args:
+    input_tensor: float Tensor of shape [batch_size, seq_length,
+      embedding_size].
+    use_token_type: bool. Whether to add embeddings for `token_type_ids`.
+    token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
+      Must be specified if `use_token_type` is True.
+    token_type_vocab_size: int. The vocabulary size of `token_type_ids`.
+    token_type_embedding_name: string. The name of the embedding table variable
+      for token type ids.
+    use_position_embeddings: bool. Whether to add position embeddings for the
+      position of each token in the sequence.
+    position_embedding_name: string. The name of the embedding table variable
+      for positional embeddings.
+    initializer_range: float. Range of the weight initialization.
+    max_position_embeddings: int. Maximum sequence length that might ever be
+      used with this model. This can be longer than the sequence length of
+      input_tensor, but cannot be shorter.
+    dropout_prob: float. Dropout probability applied to the final output tensor.
+
+  Returns:
+    float tensor with same shape as `input_tensor`.
+
+  Raises:
+    ValueError: One of the tensor shapes or input values is invalid.
+  """
+  input_shape = get_shape_list(input_tensor, expected_rank=3)
+  batch_size = input_shape[0]
+  seq_length = input_shape[1]
+  width = input_shape[2]
+
+  output = input_tensor
+
+  if use_token_type:
+    if token_type_ids is None:
+      raise ValueError("`token_type_ids` must be specified if"
+                       "`use_token_type` is True.")
+    # This vocab will be small so we always do one-hot here, since it is always
+    # faster for a small vocabulary.
+    flat_token_type_ids = tf.reshape(token_type_ids, [-1])
+    one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size)
+    token_type_embeddings = tf.matmul(one_hot_ids, weights['token_type_embedding'])
+    token_type_embeddings = tf.reshape(token_type_embeddings,
+                                       [batch_size, seq_length, width])
+    output += token_type_embeddings
+
+  if use_position_embeddings:
+    assert_op = tf.assert_less_equal(seq_length, max_position_embeddings)
+    with tf.control_dependencies([assert_op]):
+      
+      # Since the position embedding table is a learned variable, we create it
+      # using a (long) sequence length `max_position_embeddings`. The actual
+      # sequence length might be shorter than this, for faster training of
+      # tasks that do not have long sequences.
+      #
+      # So `full_position_embeddings` is effectively an embedding table
+      # for position [0, 1, 2, ..., max_position_embeddings-1], and the current
+      # sequence has positions [0, 1, 2, ... seq_length-1], so we can just
+      # perform a slice.
+      position_embeddings = tf.slice(weights['position_embededing'], [0, 0],
+                                     [seq_length, -1])
+      num_dims = len(output.shape.as_list())
+
+      # Only the last two dimensions are relevant (`seq_length` and `width`), so
+      # we broadcast among the first dimensions, which is typically just
+      # the batch size.
+      position_broadcast_shape = []
+      for _ in range(num_dims - 2):
+        position_broadcast_shape.append(1)
+      position_broadcast_shape.extend([seq_length, width])
+      position_embeddings = tf.reshape(position_embeddings,
+                                       position_broadcast_shape)
+      output += position_embeddings
+
+  #output = layer_norm_and_dropout(output, dropout_prob)
+  output = dropout(output, dropout_prob)
+  return output
 
 def create_attention_mask_from_input_mask(from_tensor, to_mask):
   """Create 3D attention mask from a 2D tensor mask.
@@ -401,8 +624,7 @@ def transformer_model(input_tensor,
                       hidden_dropout_prob=0.1,
                       attention_probs_dropout_prob=0.1,
                       initializer_range=0.02,
-                      do_return_all_layers=False,
-                      reuse=False):
+                      do_return_all_layers=False):
   """Multi-headed, multi-layer Transformer from "Attention is All You Need".
 
   This is almost an exact implementation of the original Transformer encoder.
@@ -503,7 +725,7 @@ def transformer_model(input_tensor,
     attention_output_bias = weights[transformer_name+'_attention_output_bias']
     attention_output = tf.matmul( attention_output,attention_output_weight ) + attention_output_bias
     attention_output = dropout(attention_output, hidden_dropout_prob)
-    attention_output = layer_norm(attention_output + layer_input, reuse=reuse, name=transformer_name+'_attention_output_norm')
+    #attention_output = layer_norm(attention_output + layer_input)
 
       # The activation is only applied to the "intermediate" hidden layer.
       #with tf.variable_scope("intermediate"):
@@ -517,7 +739,7 @@ def transformer_model(input_tensor,
     intermediate_output_bias = weights[transformer_name+'_intermediate_output_bias']
     layer_output = tf.matmul( intermediate_output,intermediate_output_weight ) + intermediate_output_bias 
     layer_output = dropout(layer_output, hidden_dropout_prob)
-    layer_output = layer_norm(layer_output + attention_output, reuse=reuse, name=transformer_name+'_layer_output_norm')
+    #layer_output = layer_norm(layer_output + attention_output)
     
     prev_output = layer_output
     all_layer_outputs.append(layer_output)

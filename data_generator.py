@@ -34,129 +34,122 @@ import pathlib
 import collections
 import random
 import numpy as np
-FLAGS = flags.FLAGS
-
-from bert_serving.client import BertClient
-from bert_serving.server.helper import get_args_parser
-from bert_serving.server import BertServer
-args = get_args_parser().parse_args(['-model_dir', './checkpoint/uncased_L-12_H-768_A-12',
-                                     '-num_worker', '1',
-                                     '-max_seq_len', '50',
-                                     '-pooling_strategy', 'NONE'])
-server = BertServer(args)
-server.start()
-bert_client = BertClient()
 
 
 class DataGenerator(object):
-    """
-    Data Generator capable of generating batches of sinusoid or Omniglot data.
-    A "class" is considered a class of omniglot digits or a particular sinusoid function.
-    """
-    def __init__(self, batch_size, tasks, num_samples_per_class, word_embedding_size, config={}):
-        """
-        Args:
-            num_samples_per_class: num samples to generate per class in one batch
-            batch_size: size of meta batch size (e.g. number of functions)
-            task_index_map
-        """
-        self.batch_size = batch_size
-        self.num_samples_per_class = num_samples_per_class
-        #self.test_samples_per_class = test_samples_per_class
-        self.num_classes = 1  # by default 1 (only relevant for classification problems)
+    
+    def __init__(self, meta_batch_size, tasks, num_classes, support_samples_per_class, query_samples_per_class, max_seq_len, vocab_file, config={}, test=False):
+        
+        self.meta_batch_size = meta_batch_size
+        self.support_samples_per_class = support_samples_per_class
+        self.query_samples_per_class = query_samples_per_class
+        self.num_classes = num_classes
         self.tasks = tasks
+        self.max_seq_len = max_seq_len
         print("tasks: ", tasks)
-        self.num_classes = config.get('num_classes', FLAGS.num_classes)
-        self.word_embedding_size = word_embedding_size
-        self.dim_output = self.num_classes
-        metatrain_folder = config.get('metatrain_folder', './data/train_domain')
-        if FLAGS.test:
-            metaval_folder = config.get('metaval_folder', './data/test_domain')
+        
+        self.metatrain_folder_dir = config.get('metatrain_folder', './data/train_domain')
+        if test:
+            self.metaval_folder_dir = config.get('metaval_folder', './data/test_domain')
         else:
-            metaval_folder = config.get('metaval_folder', './data/dev_domain')
+            self.metaval_folder_dir = config.get('metaval_folder', './data/dev_domain')
 
-        metatrain_folders = [os.path.join(metatrain_folder, label) \
-                for label in os.listdir(metatrain_folder) \
-                if label.split('.')[0] in self.tasks \
-                ]
-
-        metaval_folders = [os.path.join(metaval_folder, label) \
-                for label in os.listdir(metaval_folder) \
-                if label.split('.')[0] in self.tasks \
-                ]
-        self.metatrain_character_folders = metatrain_folders
-        self.metaval_character_folders = metaval_folders
         
-
-    def make_data_tensor(self, train=True):
-        if train:
-            folders = self.metatrain_character_folders
-            num_total_batches = 10
-            print("num_total_batches: ", num_total_batches)
-        else:
-            folders = self.metaval_character_folders
-            num_total_batches = 10
-
-        all_sentences = []
-        all_labels = []
-        all_test_sentences = []
-        all_test_labels = []
-        for _ in range(num_total_batches):
-            sampled_character_folders = random.sample(folders, self.batch_size)
-            random.shuffle(sampled_character_folders)
-            sentence_embedding, labels = self.collect_batch_sentence_embedding(sampled_character_folders, self.num_samples_per_class)
-            all_sentences.extend(sentence_embedding)
-            all_labels.extend(labels)
-            
-        all_sentences = np.array(all_sentences)
-        all_labels = np.array(all_labels)
-        
-        input_queue = tf.train.slice_input_producer([all_sentences, all_labels],shuffle=False)
-        num_preprocess_threads = 1 # TODO - enable this to be set to >1
-        min_queue_examples = 256
-        batch_sentence_size = self.batch_size * self.num_classes * self.num_samples_per_class
-        sentence_batch, label_batch = tf.train.batch(
-                input_queue,
-                batch_size = batch_sentence_size,
-                num_threads=num_preprocess_threads,
-                capacity=min_queue_examples + 3 * batch_sentence_size,
-                )
-        
-        #label_batch = tf.one_hot(label_batch, self.num_classes)
-        sentence_batch = tf.reshape(sentence_batch, [self.batch_size, self.num_classes * self.num_samples_per_class, FLAGS.max_seq_len, self.word_embedding_size])
-        label_batch = tf.reshape(label_batch, [self.batch_size, self.num_classes * self.num_samples_per_class])
-        
-        return sentence_batch, label_batch
-
-
-    def collect_batch_sentence_embedding(self, sampled_character_folders, num_samples_per_class):
-        support_set = []
-        for file in sampled_character_folders:
-            task_support_set = []
-            sample_pool = {'1': [], '-1':[]}
-            with open(file, 'r') as f:
+        metatrain_tasks_support = {}
+        for task in self.tasks:
+            metatrain_tasks_support[task] = {'-1':[], '1':[]}
+            with open(os.path.join(self.metatrain_folder_dir, task+'.txt'),'r') as f:
                 for line in f:
-                    text, label = line.strip().split('\t')
-                    sample_pool[str(label)].append(text)
-                #print(file, len(sample_pool['1']), len(sample_pool['-1']))
-                if (len(sample_pool['-1']) < num_samples_per_class) or (len(sample_pool['1']) < num_samples_per_class):
-                    print("num_samples_per_class > #samples in this file: ", file)
-                pos_sample = random.sample(sample_pool['1'], num_samples_per_class)
-                neg_sample = random.sample(sample_pool['-1'], num_samples_per_class)
-                task_support_set.extend([(s,1) for s in pos_sample]) 
-                task_support_set.extend([(s,0) for s in neg_sample]) 
-                random.shuffle(task_support_set)
-                support_set.extend(task_support_set)
-                
-        random.shuffle(support_set)
-        text_list = [s for (s,l) in support_set]
-        label_list = [l for (s,l) in support_set]
-        #print("bert_client encoding")
-        sentence_embedding = bert_client.encode(text_list) #[task_per_batch * num_class * sample_per_class, seq_len, embedding_size]
+                    line = line.strip().split('\t')
+                    metatrain_tasks_support[task][line[1]].append(line[0])
+        metaval_tasks_query = {}
+        for task in self.tasks:
+            metaval_tasks_query[task] = {'-1':[], '1':[]}
+            with open(os.path.join(self.metaval_folder_dir, task+'.txt'),'r') as f:
+                for line in f:
+                    line = line.strip().split('\t')
+                    metaval_tasks_query[task][line[1]].append(line[0])
+
+        self.metatrain_tasks_support = metatrain_tasks_support
+        self.metaval_tasks_query = metaval_tasks_query
+        self.tokenizer = tokenization.FullTokenizer(vocab_file=vocab_file, do_lower_case=True)
+
+
+    def sentence_tokenization(self, sentence):
+        tokens = self.tokenizer.tokenize(sentence)
+        if len(tokens) > self.max_seq_len - 2:
+            tokens = tokens[0:(self.max_seq_len - 2)]
+        ntokens = []
+        segment_ids = []
+        ntokens.append("[CLS]")
+        segment_ids.append(0)
+        for token in tokens:
+            ntokens.append(token)
+            segment_ids.append(0)
+        ntokens.append("[SEP]")
+        segment_ids.append(0)
+        input_ids = self.tokenizer.convert_tokens_to_ids(ntokens)
+        input_mask = [1] * len(input_ids)
+        while len(input_ids) < self.max_seq_len:
+            input_ids.append(0)
+            input_mask.append(0)
+            segment_ids.append(0)
+
+        assert len(input_ids) == self.max_seq_len
+        assert len(input_mask) == self.max_seq_len
+        assert len(segment_ids) == self.max_seq_len
+        return input_ids, segment_ids, input_mask
+
+    def generate_single_batch_data(self, train=True):
         
+        single_batch_input_ids = []
+        single_batch_segment_ids = []
+        single_batch_input_mask = []
+        single_batch_labels = []
 
-        return sentence_embedding, label_list
+        sampled_tasks = random.sample(self.tasks, self.meta_batch_size)
+        for task in sampled_tasks:
+            task_input_ids = []
+            task_segment_ids = []
+            task_input_mask = []
+            task_labels = []
 
+            single_support_set = random.sample(self.metatrain_tasks_support[task]['1'], self.support_samples_per_class) + \
+                            random.sample(self.metatrain_tasks_support[task]['-1'], self.support_samples_per_class)
+            single_support_labels = [1]*self.support_samples_per_class + [0]*self.support_samples_per_class
+            c = list(zip(single_support_set, single_support_labels))
+            random.shuffle(c)
+            single_support_set, single_support_labels = zip(*c)
+            
+            single_query_set = random.sample(self.metaval_tasks_query[task]['1'], self.query_samples_per_class) + \
+                            random.sample(self.metaval_tasks_query[task]['-1'], self.query_samples_per_class)
+            single_query_labels = [1]*self.query_samples_per_class + [0]*self.query_samples_per_class
+            c = list(zip(single_query_set, single_query_labels))
+            random.shuffle(c)
+            single_query_set, single_query_labels = zip(*c)
 
+            single_task_set = single_support_set + single_query_set
+            task_labels = single_support_labels + single_query_labels
 
+            for sentence in single_task_set:
+                input_ids, segment_ids, input_mask = self.sentence_tokenization(sentence)
+                task_input_ids.append(input_ids)
+                task_segment_ids.append(segment_ids)
+                task_input_mask.append(input_mask)
 
+            single_batch_input_ids.append(task_input_ids)
+            single_batch_segment_ids.append(task_segment_ids)
+            single_batch_input_mask.append(task_input_mask)
+            single_batch_labels.append(task_labels)
+
+        single_batch_input_ids = np.array(single_batch_input_ids)
+        single_batch_segment_ids = np.array(single_batch_segment_ids)
+        single_batch_input_mask = np.array(single_batch_input_mask)
+        single_batch_labels = np.array(single_batch_labels)
+
+        assert single_batch_input_ids.shape == (self.meta_batch_size, self.num_classes*(self.support_samples_per_class+self.query_samples_per_class), self.max_seq_len)
+        assert single_batch_segment_ids.shape == (self.meta_batch_size, self.num_classes*(self.support_samples_per_class+self.query_samples_per_class), self.max_seq_len)
+        assert single_batch_input_mask.shape == (self.meta_batch_size, self.num_classes*(self.support_samples_per_class+self.query_samples_per_class), self.max_seq_len)
+        assert single_batch_labels.shape == (self.meta_batch_size, self.num_classes*(self.support_samples_per_class+self.query_samples_per_class))
+
+        return single_batch_input_ids, single_batch_segment_ids, single_batch_input_mask, single_batch_labels
